@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Charlie voice bridge (runs on your always-on Linux box).
+"""Charlie voice bridge (runs on the Linux host).
 
 Echo Dot agent <-(adb forward over Wi-Fi adb)-> this bridge -> faster-whisper -> Charlie webhook
 -> reply (inbox file or local HTTP POST) -> Piper TTS -> Dot playback.
 All configuration comes from the environment (see config.env.example).
 """
 import random
-import json, os, queue, socket, struct, subprocess, sys, threading, time, uuid
+import json, os, queue, re, socket, struct, subprocess, sys, threading, time, uuid
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -16,9 +16,9 @@ import numpy as np
 HOME = Path(__file__).resolve().parent.parent
 E = os.environ.get
 ADB = E("ADB", str(Path.home() / ".local/bin/adb"))
-DOT = E("DOT_ADB", "DOT_HOST:5555")  # REQUIRED: set real host:port in config.env
+DOT = E("DOT_ADB", "DOT_HOST:5555")
 PORT = int(E("BRIDGE_PORT", "8790"))          # agent port on the Dot (127.0.0.1)
-LOCAL_PORT = int(E("LOCAL_PORT", "18790"))   # adb forward port on the Linux box
+LOCAL_PORT = int(E("LOCAL_PORT", "18790"))   # adb forward port on the Linux host
 REPLY_BIND = E("REPLY_BIND", "127.0.0.1")
 REPLY_PORT = int(E("REPLY_PORT", "8791"))
 WEBHOOK = E("CHARLIE_WEBHOOK_URL", "").strip()
@@ -47,10 +47,32 @@ CHARLIE_PERSONA = (
     "You are Charlie, Michael Gannotti's chief of staff for his fleet of Grok Bots, speaking out loud through an "
     "Echo Dot in a calm, friendly male voice. Answer in one to three short spoken sentences. Plain words only: no "
     "markdown, lists, emoji, URLs or code. You have no tools. Never name Michael's employer; if his job comes up, "
-    "If the request needs the real Charlie (doing a task, sending or "
-    "checking anything, memory or notes, calendars, email, other bots, current or private facts you cannot know), "
-    "begin your reply with the exact tag [HANDOFF] followed by one short line telling Michael you're passing it to "
-    "the full Charlie, e.g. '[HANDOFF] Let me check with the team on that, one moment.'")
+    "he is a Principal AI Solutions Engineer. If the request needs the real Charlie (doing a task, sending or "
+    "checking anything, a status report, memory or notes, calendars, email, other bots, current or private facts "
+    "you cannot know), begin your reply with the exact tag [HANDOFF] and write nothing after it. Stay silent. "
+    "Do not say you are checking with the team, passing that to the team, waiting on the team, or that you will "
+    "let Michael know later. Do not promise a follow-up. The bridge speaks Charlie's answer when it arrives.")
+NO_UPDATE = "I don't have that update yet."
+# Spoken lines that promise a follow-up. The bridge cuts these and waits for Charlie instead.
+_HOLDING_RE = re.compile(
+    r"(check(?:ing)? with the team"
+    r"|pass(?:ing)? (?:that |it |this )?to the team"
+    r"|(?:wait(?:ing)?|still waiting) on the team"
+    r"|let you know"
+    r"|one moment"
+    r"|pull that together"
+    r"|hang tight"
+    r"|the team(?:'s| is) still"
+    r"|comes back"
+    r"|as soon as (?:it|they))",
+    re.I)
+
+def _looks_like_holding(text):
+    """True for a short line that promises a team follow-up instead of answering."""
+    t = " ".join((text or "").split())
+    if not t or len(t) > 220:
+        return False
+    return _HOLDING_RE.search(t) is not None
 
 def log(*a):
     print(time.strftime("%H:%M:%S"), *a, flush=True)
@@ -353,7 +375,6 @@ class ReplyHandler(BaseHTTPRequestHandler):
         pass
 
 # ---------------- Fast brain (Grok Build CLI, subscription login; never XAI_API_KEY) ----------------
-import re
 _SENT = re.compile(r"(.+?[.!?])(\s+|$)", re.S)
 
 class Speaker:
@@ -386,7 +407,7 @@ FILLER_DELAY = float(E("FILLER_DELAY", "1.6" if BRAIN == "local" else "1.0"))   
 FILLER_TEXTS = ["Mm-hmm.", "Okay.", "Sure.", "Got it.", "Right."]
 FILLERS = []          # pre-rendered (pcm, rate)
 _REMIND = ("(Stay in character as Charlie: one to three short spoken sentences, plain words, no tools; "
-           "start with [HANDOFF] if it needs the full Charlie.)")
+           "if it needs the full Charlie, reply with only [HANDOFF] and no other words.)")
 
 def load_fillers():
     for t in FILLER_TEXTS:
@@ -546,7 +567,7 @@ class WarmGrok:
 warm = WarmGrok()
 
 class StreamSpeak:
-    """Turns streamed text into spoken sentences; handles the [HANDOFF] tag."""
+    """Turns streamed text into spoken sentences. A [HANDOFF] reply is not spoken."""
     def __init__(self, why, ts, t0):
         self.why, self.ts, self.t0 = why, ts, t0
         self.buf = self.full = ""; self.spk = None; self.handoff = False
@@ -554,13 +575,16 @@ class StreamSpeak:
         self.full += d; self.buf += d
         lead = self.full.lstrip()
         if not self.handoff and lead.startswith("[HANDOFF]"):
-            self.handoff = True; self.buf = self.buf.replace("[HANDOFF]", "")
-        elif "[HANDOFF]"[:len(lead)] == lead:
+            self.handoff = True; self.buf = self.buf.replace("[HANDOFF]", "", 1)
+            return   # stay quiet; Charlie's answer is spoken when it arrives
+        elif not self.handoff and lead and "[HANDOFF]"[:len(lead)] == lead:
+            return
+        if self.handoff:
             return
         while True:
             m = _SENT.match(self.buf)
-            if not m or not (m.group(2) or (self.handoff and self.spk is None)):
-                break   # a handoff's first sentence goes out the moment its punctuation arrives
+            if not m or not m.group(2):
+                break
             self._say(m.group(1)); self.buf = self.buf[m.end():]
     def _say(self, s):
         if self.spk is None:
@@ -569,11 +593,15 @@ class StreamSpeak:
     def reply(self):
         return self.full.replace("[HANDOFF]", "").strip()
     def finish(self):
+        if self.handoff:
+            self.buf = ""
+            if self.spk: self.spk.close(False)
+            return
         if self.buf.strip():
             self._say(self.buf); self.buf = ""
         if self.spk: self.spk.close()
 
-LOCAL_LLM_URL = E("LOCAL_LLM_URL", "http://127.0.0.1:8792/v1/chat/completions")
+LOCAL_LLM_URL = E("LOCAL_LLM_URL", "http://127.0.0.1:8080/v1/chat/completions")
 
 def local_reply(history, text, why, t_end=None, ts=None):
     """BRAIN=local: llama.cpp server (OpenAI-compatible, streaming). Returns (reply, handoff) or (None, False)."""
@@ -591,7 +619,7 @@ def local_reply(history, text, why, t_end=None, ts=None):
                 st.feed(json.loads(line[6:])["choices"][0]["delta"].get("content") or "")
     except Exception as e:
         log("local brain failed:", e)
-    if not st.reply():
+    if not st.reply() and not st.handoff:
         if st.spk: st.spk.close(False)
         return None, False
     st.finish()
@@ -612,7 +640,7 @@ def fast_reply(history, text, why, t_end=None, key=None, ts=None):
             warm.ask(key or why, text, history, st.feed)
         except Exception as e:
             log("warm grok failed:", e)
-        if st.reply():
+        if st.handoff or st.reply():
             st.finish()
             if t_end and st.spk and st.spk.first:
                 log(f"fast brain (warm): end of speech -> first audio {st.spk.first - t_end:.1f}s")
@@ -646,10 +674,13 @@ def cold_reply(history, text, why, t_end=None, ts=None):
             if ev.get("type") != "text":
                 continue
             d = ev.get("data", ""); full += d; buf += d
-            if not handoff and full.lstrip().startswith("[HANDOFF]"):
-                handoff = True; buf = buf.replace("[HANDOFF]", "")
-            elif "[HANDOFF]"[:len(full.lstrip())] == full.lstrip():
+            lead = full.lstrip()
+            if not handoff and lead.startswith("[HANDOFF]"):
+                handoff = True; buf = buf.replace("[HANDOFF]", "", 1)
+            elif not handoff and lead and "[HANDOFF]"[:len(lead)] == lead:
                 continue  # tag still arriving
+            if handoff:
+                continue  # stay quiet; Charlie's answer is spoken when it arrives
             while True:
                 m = _SENT.match(buf)
                 if not m or not m.group(2):
@@ -663,6 +694,10 @@ def cold_reply(history, text, why, t_end=None, ts=None):
     except Exception as e:
         log("fast brain failed:", e)
     reply = full.replace("[HANDOFF]", "").strip()
+    if handoff:
+        if spk: spk.close(False)
+        log(f"fast brain reply ({time.time()-t0:.1f}s, handoff=True, quiet): {reply}")
+        return reply, True
     if not reply:
         if spk: spk.close(False)
         log(f"fast brain gave no reply ({time.time()-t0:.1f}s); falling back to webhook")
@@ -685,11 +720,11 @@ def charlie_followup(session_id, turn, body):
     except Exception as e:
         log("webhook (fast-brain copy) failed:", e)
         if body.get("handoff"):
-            say_reply("Sorry, I couldn't reach the full Charlie.", "handoff-fail")
+            say_reply(NO_UPDATE, "handoff-fail")
         return
     if body.get("handoff"):
         r = wait_reply(session_id, turn)
-        say_reply(r or "The full Charlie hasn't answered yet.", f"handoff {session_id}#{turn}")
+        say_reply(r or NO_UPDATE, f"handoff {session_id}#{turn}")
 
 # ---------------- Realtime speech-to-speech (xAI grok-voice) ----------------
 RT_URL = E("RT_URL", "wss://api.x.ai/v1/realtime")
@@ -704,14 +739,16 @@ RT_PERSONA = (
     "# Role\nYou are Charlie, Michael Gannotti's chief of staff for his fleet of Grok Bots. You talk with Michael "
     "out loud through an Echo Dot. You are a calm, warm, friendly man.\n"
     "# Style\nKeep every reply to one to three short spoken sentences. Plain conversational speech, no lists.\n"
-    "# Rules\nNever name Michael's employer. "
+    "# Rules\nNever name Michael's employer; if his job comes up, he is a Principal AI Solutions Engineer. "
     "Do not invent facts about Michael's calendar, email, notes, tasks or bots.\n"
-    "# Tools\nWhen Michael asks for a real task (checking or changing his calendar or email, sending anything, "
-    "notes or memory, his other bots, or private or current facts you cannot know), say one short line such as "
-    "'Let me pass that to the team, one moment.' and call handoff_to_charlie with his request. When the result "
-    "comes back, tell Michael the answer briefly in your own words.")
+    "# Tools\nWhen Michael asks for a real task (a status report, checking or changing his calendar or email, "
+    "sending anything, notes or memory, his other bots, or private or current facts you cannot know), call "
+    "handoff_to_charlie with his request and do not speak. Say nothing before the tool returns. Do not say you "
+    "are checking with the team, passing that to the team, waiting on the team, or that you will let him know "
+    "when you have it. Do not promise a follow-up. The bridge speaks Charlie's answer. If you speak at all before "
+    "the tool result, the only allowed words are: One moment.")
 RT_TOOLS = [{"type": "function", "name": "handoff_to_charlie",
-             "description": "Pass a real task or question that needs Michael's data or actions to the full Charlie agent and get its answer.",
+             "description": "Pass Michael's request to the full Charlie and return Charlie's answer. Call this with no spoken words.",
              "parameters": {"type": "object", "properties": {"request": {"type": "string",
                             "description": "Michael's request, restated clearly."}}, "required": ["request"]}}]
 
@@ -726,10 +763,17 @@ class Realtime:
         self.opened = None; self.t_stop = None; self.first_logged = False
         self.streaming = False; self.pend = b""; self.user_text = ""; self.bot_text = ""
         self.lock = threading.Lock(); self.calls = 0
+        self.quiet_gen = self.accept_gen = 0   # drop model audio while these differ
+        self.turn_handed = False                # this user turn already started a Charlie handoff
+        self.delivering = False                 # verbatim Charlie answer is being spoken
+        self.resp_epoch = 0                     # increments on each response.done
+        self.partial = ""
         threading.Thread(target=self.run, daemon=True).start()
 
     # ----- Dot output -----
     def _out(self, b):
+        if self.quiet_gen != self.accept_gen:
+            return   # holding line: stay quiet until Charlie's answer is ready
         self.last_out = time.time()
         x = np.frombuffer(b, dtype="<i2")
         if RT_GAIN != 1.0:
@@ -841,20 +885,47 @@ class Realtime:
                 log(f"[{self.s.id}] realtime: barge-in, stopping playback"); self._finish(stop=True)
         elif t == "input_audio_buffer.speech_stopped":
             self.t_stop = time.time() - 0.0; self.first_logged = False
+            self.partial = ""
+            if self.quiet_gen == self.accept_gen:   # a handoff in flight keeps the turn flag
+                self.turn_handed = False; self.delivering = False
         elif t == "conversation.item.input_audio_transcription.completed":
             txt = (e.get("transcript") or "").strip()
             if txt and txt != self.user_text: log(f"[{self.s.id}] heard: {txt}")
             self.user_text = txt or self.user_text
+        elif t == "response.output_audio_transcript.delta":
+            self.partial += e.get("delta") or ""
+            self._note_holding_audio(self.partial)
         elif t == "response.output_audio_transcript.done":
             self.bot_text = (e.get("transcript") or "").strip()
+            self.partial = ""
+            self._note_holding_audio(self.bot_text)
+        elif t == "response.output_item.added" and (e.get("item") or {}).get("name") == "handoff_to_charlie":
+            self._quiet_holding()
+        elif t == "response.function_call_arguments.delta" and e.get("name") == "handoff_to_charlie":
+            self._quiet_holding()
         elif t == "response.function_call_arguments.done" and e.get("name") == "handoff_to_charlie":
-            threading.Thread(target=self.handoff, args=(e,), daemon=True).start()
+            self._start_handoff(e, wait_for_done=True)
         elif t == "response.done":
-            self._finish()
+            holding = _looks_like_holding(self.bot_text) and not self.delivering
+            if holding:
+                self._note_holding_audio(self.bot_text)
+            if self.quiet_gen != self.accept_gen and not self.delivering:
+                self.pend = b""
+                if self.streaming:
+                    self._finish(stop=True)
+            else:
+                self._finish()
+            self.resp_epoch += 1
+            if holding and not self.turn_handed:
+                log(f"[{self.s.id}] holding line with no tool call; handing off quietly")
+                self._start_handoff(None, wait_for_done=False)
+            elif self.quiet_gen != self.accept_gen and not self.turn_handed and not self.delivering:
+                self.accept_gen = self.quiet_gen   # not a handoff; don't mute the rest of the session
             if self.bot_text or self.user_text:
                 log(f"[{self.s.id}] charlie (realtime): {self.bot_text}")
                 self.post_turn(self.user_text, self.bot_text)
             self.user_text = self.bot_text = ""
+            self.partial = ""
         elif t == "error":
             log(f"[{self.s.id}] realtime error: {json.dumps(e)[:300]}")
 
@@ -870,41 +941,95 @@ class Realtime:
         try: post_webhook(body)
         except Exception as ex: log("webhook (realtime copy) failed:", ex)
 
-    def handoff(self, e):
-        try:
-            req = json.loads(e.get("arguments") or "{}").get("request") or self.user_text
-        except ValueError:
-            req = self.user_text
+    def _quiet(self):
+        """Drop model audio and cut anything already headed for the speaker."""
+        self.quiet_gen += 1
+        self.pend = b""
+        if self.streaming:
+            log(f"[{self.s.id}] handoff: cutting holding audio")
+            self._finish(stop=True)
+        return self.quiet_gen
+
+    def _allow_audio(self, gen):
+        if self.quiet_gen == gen:
+            self.accept_gen = gen
+
+    def _quiet_holding(self):
+        """Stop a holding line as soon as the handoff tool shows up."""
+        if self.delivering or self.turn_handed:
+            return
+        if self.quiet_gen == self.accept_gen:
+            log(f"[{self.s.id}] holding line suppressed")
+            self._quiet()
+
+    def _note_holding_audio(self, text):
+        if self.delivering or self.turn_handed:
+            return
+        if not _looks_like_holding(text):
+            return
+        self._quiet_holding()
+
+    def _start_handoff(self, e, wait_for_done):
+        if self.turn_handed:
+            return
+        self.turn_handed = True
+        gen = self.quiet_gen if self.quiet_gen != self.accept_gen else self._quiet()
+        epoch = self.resp_epoch
+        threading.Thread(target=self.handoff, args=(e, gen, epoch, wait_for_done), daemon=True).start()
+
+    def handoff(self, e, gen, epoch, wait_for_done):
+        call_id = None
+        req = self.user_text
+        if e:
+            call_id = e.get("call_id")
+            try:
+                req = json.loads(e.get("arguments") or "{}").get("request") or self.user_text
+            except ValueError:
+                req = self.user_text
         self.s.turn += 1; turn = self.s.turn
-        log(f"[{self.s.id} #{turn}] realtime handoff to Charlie: {req}")
+        log(f"[{self.s.id} #{turn}] realtime handoff to Charlie (quiet): {req}")
         body = {"session_id": self.s.id, "turn": turn, "text": req, "ended": False,
-                "brain": "realtime", "fast_reply": self.bot_text, "handoff": True}
+                "brain": "realtime", "fast_reply": "", "handoff": True}
         mark_handoff(self.s.id, turn)
         try:
-            post_webhook(body); reply = wait_reply(self.s.id, turn)
+            post_webhook(body)
         except Exception as ex:
             log("handoff webhook failed:", ex); reply = None
-        reply = reply or "The full Charlie hasn't answered yet."
-        log(f"[{self.s.id} #{turn}] Charlie replied: {reply[:120]}")
-        if self.ok:
-            dot.playing_done.wait(30) if self.streaming or dot.playing else None
-            self.send({"type": "conversation.item.create", "item": {"type": "function_call_output",
-                       "call_id": e.get("call_id"), "output": json.dumps({"charlie_reply": reply})}})
-            t_inj = time.time()
-            self.send({"type": "response.create", "response": {"instructions": RT_PERSONA +
-                       "\nCharlie's team just answered. Tell Michael that answer now, briefly, in your own words."}})
-            while time.time() - t_inj < 6 and self.ok and self.last_out < t_inj:
-                time.sleep(0.1)
-            if self.ok and self.last_out < t_inj:
-                log(f"[{self.s.id} #{turn}] model did not speak the handoff answer; forcing it verbatim")
-                self.send({"type": "conversation.item.create", "item": {"type": "force_message", "role": "assistant",
-                           "interruptible": True, "content": [{"type": "output_text", "text": reply}]}})
-            elif not self.ok:
-                rt_say(reply, f"handoff {self.s.id}#{turn}")
-            else:
-                log(f"[{self.s.id} #{turn}] handoff answer spoken in the live realtime session")
         else:
-            rt_say(reply, f"handoff {self.s.id}#{turn}")   # session already closed: short Rex-only session
+            reply = wait_reply(self.s.id, turn)
+        reply = (reply or "").strip() or NO_UPDATE
+        log(f"[{self.s.id} #{turn}] Charlie replied: {reply[:120]}")
+        try:
+            self._speak_verbatim(reply, gen, epoch, wait_for_done, call_id, turn)
+        finally:
+            if self.quiet_gen == gen and self.accept_gen != gen:
+                self.accept_gen = gen
+            self.delivering = False
+
+    def _speak_verbatim(self, text, gen, epoch, wait_for_done, call_id, turn):
+        """Speak Charlie's text as-is. Do not ask the model to rephrase it."""
+        if wait_for_done:
+            deadline = time.time() + 4
+            while self.ok and self.resp_epoch == epoch and time.time() < deadline:
+                time.sleep(0.05)
+        if not self.ok:
+            rt_say(text, f"handoff {self.s.id}#{turn}")
+            return
+        if call_id:
+            self.send({"type": "conversation.item.create", "item": {"type": "function_call_output",
+                       "call_id": call_id, "output": json.dumps({"charlie_reply": text})}})
+        self.delivering = True
+        self._allow_audio(gen)
+        t_inj = time.time()
+        self.send({"type": "conversation.item.create", "item": {"type": "force_message", "role": "assistant",
+                   "interruptible": True, "content": [{"type": "output_text", "text": text}]}})
+        while time.time() - t_inj < 6 and self.ok and self.last_out < t_inj:
+            time.sleep(0.1)
+        if not self.ok or self.last_out < t_inj:
+            log(f"[{self.s.id} #{turn}] verbatim handoff produced no live audio; speak-only session")
+            rt_say(text, f"handoff {self.s.id}#{turn}")
+        else:
+            log(f"[{self.s.id} #{turn}] handoff answer spoken verbatim")
 
     def guard(self):
         while self.ok and not self.closing:
@@ -1043,10 +1168,10 @@ class Session:
                 reply, handoff = fast_reply(self.history, text, f"{self.id}#{self.turn}",
                                              t_end=self.t_end, key=self.id, ts=ts)
                 if reply is not None:
-                    self.history.append((text, reply))
+                    self.history.append((text, "" if handoff else reply))
                     if not handoff:
                         suppressed.add((self.id, self.turn))
-                    body.update({"brain": "fast", "fast_reply": reply, "handoff": handoff})
+                    body.update({"brain": "fast", "fast_reply": "" if handoff else reply, "handoff": bool(handoff)})
                     threading.Thread(target=charlie_followup, args=(self.id, self.turn, body), daemon=True).start()
                     continue
             try:
@@ -1060,7 +1185,7 @@ class Session:
                 deliver_reply(self.id, self.turn, "Sorry, I couldn't reach Charlie.")
             reply = wait_reply(self.id, self.turn)
             if reply is None:
-                reply = "Charlie hasn't answered yet."
+                reply = NO_UPDATE
             log(f"[{self.id} #{self.turn}] reply: {reply}")
             self.history.append((text, reply))
             say_reply(reply, f"{self.id}#{self.turn}")

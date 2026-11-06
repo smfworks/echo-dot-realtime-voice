@@ -41,7 +41,7 @@ Echo Dot (already rooted)              Always-on Linux box
 - **On the Dot:** `dot-agent/DotAgent.java` watches the mute button, streams mic audio (16 kHz mono) out, and plays audio it gets back. It stops listening while it is talking so it does not hear itself.
 - **Over adb:** the Linux box connects to the Dot over Wi-Fi and forwards a **local** port to the agent. Nothing needs to listen openly on your LAN. Authorize **only** your Linux box's adb key on the Dot.
 - **On the Linux box:** `bridge/bridge.py` keeps the connection alive, relaunches the Dot agent if it dies, and moves audio between the Dot and the voice brain.
-- **Handoff:** when you ask for real work, the voice model calls a tool that POSTs to your agent's webhook, then speaks the answer in the same voice.
+- **Handoff:** a status or real-work ask stays quiet. The realtime brain calls `handoff_to_charlie` and does not speak. The fast brain begins with `[HANDOFF]` and nothing else. The bridge POSTs `handoff: true`, waits for `~/charlie-voice/inbox/<session>-<turn>.txt`, and speaks that reply verbatim in the same Rex voice. If the agent does not answer in time, or the webhook fails, it says `I don't have that update yet.`
 
 ## Post-root steps (high level)
 
@@ -52,7 +52,7 @@ Echo Dot (already rooted)              Always-on Linux box
 5. **Configure the bridge.** Copy `config.env.example` → `~/charlie-voice/config.env`, fill in webhook + `XAI_VOICE_API_KEY`, keep it mode `600`. Install deps into `.venv`, then enable `systemd/charlie-voice.service` as a user unit (`%h` paths only).
 6. **Drive sessions from the real mic state.** Real audio means unmuted → start a session (high beep). Exact zeros mean muted → end it (low beep). Do not count button presses; the hardware mute returns exact zeros.
 7. **Connect realtime voice.** Open a WebSocket on unmute (`wss://api.x.ai/v1/realtime`, model `grok-voice-3.0`, voice `rex`) and close it on mute. Stream mic audio up; play 48 kHz PCM back down to the Dot.
-8. **Add the handoff tool.** The model calls `handoff_to_charlie` → bridge POSTs to `CHARLIE_WEBHOOK_URL` → speaks the reply when it arrives (same Rex voice, even if you already muted).
+8. **Hand off quietly.** The personas no longer tell the model to say a team holding line such as "Let me check with the team on that, one moment" or "Let me pass that to the team, one moment." A status or handoff ask calls `handoff_to_charlie` (realtime) or starts with `[HANDOFF]` (fast brain) and stays silent: no team-holding line, no promised follow-up. The bridge POSTs `handoff: true` to `CHARLIE_WEBHOOK_URL`, waits for `~/charlie-voice/inbox/<session>-<turn>.txt`, and speaks that file verbatim in the same Rex voice. If you mute before the answer arrives, a speak-only session still delivers Charlie's text, or the same timeout line. If Charlie does not answer in time, or the webhook fails, the Dot says `I don't have that update yet.` instead of going silent. If the model improvises a holding line anyway (checking, passing, or waiting on the team, "let you know," "one moment," and similar), the bridge strips it and does not speak it.
 9. **Add a cost guard.** Default cap is **15 minutes** per session (`RT_MAX_SECS=900`). At the limit it says goodbye and hangs up.
 
 ## Lessons learned
@@ -78,7 +78,9 @@ Echo Dot (already rooted)              Always-on Linux box
 | Warm Grok CLI + local speech-to-text and text-to-speech | 2 to 4 seconds. "So so." |
 | xAI realtime, grok-voice-3.0, male voice Rex | Natural back-and-forth. "Worked perfect." |
 
-**Keep it one voice.** Late handoff answers are spoken in the same realtime Rex voice. Mixing a second TTS voice for sign-offs sounded jarring.
+**Keep it one voice.** Late handoff answers are spoken in the same realtime Rex voice, including after you mute. Mixing a second TTS voice for sign-offs sounded jarring.
+
+**Stay quiet while Charlie answers.** The holding line made the Dot promise a follow-up it did not have. The realtime and fast personas now tell the model to call `handoff_to_charlie` or begin with `[HANDOFF]` and stay silent. The bridge posts `handoff: true`, waits for the inbox file, and speaks Charlie's text verbatim. An improvised holding line is cut. If the wait times out or the webhook fails, the line is `I don't have that update yet.` Muting early does not drop it: a speak-only session still says Charlie's text, or that same timeout line, in Rex's voice. `tests/test_handoff_quiet.py` checks this offline (`STUB_ECHO=1`).
 
 **Realtime details that mattered:**
 
@@ -101,7 +103,7 @@ bridge/bridge.py              # Linux-side bridge (systemd)
 dot-agent/DotAgent.java       # On-device agent source
 systemd/charlie-voice.service # User unit with %h paths
 config.env.example            # Key names + placeholders only
-tests/                        # Offline / webhook helpers (no secrets)
+tests/                        # Offline helpers (no secrets), including test_handoff_quiet.py
 ATTRIBUTION.md                # Grok Build / Grok Bot credit
 LICENSE                       # MIT (SMF Works)
 ```
