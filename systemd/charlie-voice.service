@@ -1,0 +1,12 @@
+[Unit]
+Description=Charlie voice bridge (Echo Dot <-> Charlie)
+After=network-online.target
+
+[Service]
+EnvironmentFile=-%h/charlie-voice/config.env
+ExecStart=%h/charlie-voice/.venv/bin/python -u %h/charlie-voice/bridge/bridge.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
