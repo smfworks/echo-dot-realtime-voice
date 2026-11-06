@@ -1,0 +1,48 @@
+# Secrets and local runtime
+config.env
+config.env.bak*
+*.env
+!.env.example
+config.env.example.bak*
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Local models / binaries (too large; not part of the how-to)
+llm/
+voices/
+*.gguf
+*.onnx
+*.onnx.json
+dot-agent/*.dex
+dot-agent/*.dex.bak*
+
+# Runtime data
+logs/
+inbox/
+replies/
+*.jsonl
+*.wav
+*.log
+
+# adb / device keys
+adbkey
+adbkey.pub
+*.pem
+*.key
+id_rsa*
+*.keystore
+
+# Backups / local notes
+*.bak*
+survey.md
+dot-boot/
+.deny-terms.pkl
+
+# OS junk
+.DS_Store
+Thumbs.db
